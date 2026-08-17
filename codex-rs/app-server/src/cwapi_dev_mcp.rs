@@ -51,36 +51,32 @@ struct WorkspaceResult {
 }
 
 pub(crate) async fn call(tool: &str, arguments: Option<JsonValue>) -> McpServerToolCallResponse {
-    let result = match tool {
-        "workspace.open" => decode_args(arguments).and_then(|args| Ok(args)).map_err(|err| err).map(|args: WorkspaceOpenArgs| args),
-        _ => Err(tool_error("CWAPI_TOOL_UNKNOWN", format!("unknown cwapi-dev tool: {tool}"))),
-    };
-
-    match result {
-        Ok(args) => match workspace_open(args).await {
-            Ok(value) => success_response(value),
+    match tool {
+        "workspace.open" => match decode_args::<WorkspaceOpenArgs>(arguments) {
+            Ok(args) => match workspace_open(args).await {
+                Ok(value) => success_response(value),
+                Err(error) => error_response(error),
+            },
             Err(error) => error_response(error),
         },
-        Err(error) if tool == "workspace.open" => error_response(error),
-        Err(error) if tool == "workspace.status" => {
-            match decode_args::<WorkspaceStatusArgs>(arguments) {
-                Ok(args) => match workspace_status(args).await {
-                    Ok(value) => success_response(value),
-                    Err(error) => error_response(error),
-                },
+        "workspace.status" => match decode_args::<WorkspaceStatusArgs>(arguments) {
+            Ok(args) => match workspace_status(args).await {
+                Ok(value) => success_response(value),
                 Err(error) => error_response(error),
-            }
-        }
-        Err(error) if tool == "workspace.close" => {
-            match decode_args::<WorkspaceCloseArgs>(arguments) {
-                Ok(args) => match workspace_close(args).await {
-                    Ok(value) => success_response(value),
-                    Err(error) => error_response(error),
-                },
+            },
+            Err(error) => error_response(error),
+        },
+        "workspace.close" => match decode_args::<WorkspaceCloseArgs>(arguments) {
+            Ok(args) => match workspace_close(args).await {
+                Ok(value) => success_response(value),
                 Err(error) => error_response(error),
-            }
-        }
-        Err(error) => error_response(error),
+            },
+            Err(error) => error_response(error),
+        },
+        _ => error_response(tool_error(
+            "CWAPI_TOOL_UNKNOWN",
+            format!("unknown cwapi-dev tool: {tool}"),
+        )),
     }
 }
 
@@ -105,10 +101,11 @@ async fn workspace_open(args: WorkspaceOpenArgs) -> Result<WorkspaceResult, Tool
         .await
         .map_err(|error| tool_error("CWAPI_WORKSPACE_ROOT_CREATE_FAILED", error.to_string()))?;
 
+    let commit_spec = format!("{}^{{commit}}", args.expected_commit);
     let verified = run_git(
         &args.git_path,
         Some(&args.repository_path),
-        ["rev-parse", "--verify", &format!("{}^{{commit}}", args.expected_commit)],
+        &["rev-parse", "--verify", &commit_spec],
     )
     .await?;
     let verified_commit = stdout_line(&verified)?;
@@ -123,7 +120,13 @@ async fn workspace_open(args: WorkspaceOpenArgs) -> Result<WorkspaceResult, Tool
     run_git(
         &args.git_path,
         Some(&args.repository_path),
-        ["worktree", "add", "--detach", &workspace_text, &args.expected_commit],
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &workspace_text,
+            &args.expected_commit,
+        ],
     )
     .await?;
 
@@ -168,7 +171,7 @@ async fn workspace_result(
     workspace_path: &Path,
     expected_commit: &str,
 ) -> Result<WorkspaceResult, ToolError> {
-    let head = run_git(git_path, Some(workspace_path), ["rev-parse", "HEAD"]).await?;
+    let head = run_git(git_path, Some(workspace_path), &["rev-parse", "HEAD"]).await?;
     let actual_commit = stdout_line(&head)?;
     if !actual_commit.eq_ignore_ascii_case(expected_commit) {
         return Err(tool_error(
@@ -176,7 +179,7 @@ async fn workspace_result(
             format!("expected {expected_commit}, actual {actual_commit}"),
         ));
     }
-    let status = run_git(git_path, Some(workspace_path), ["status", "--porcelain"]).await?;
+    let status = run_git(git_path, Some(workspace_path), &["status", "--porcelain"]).await?;
     let clean = status.stdout.is_empty();
     if !clean {
         return Err(tool_error(
@@ -200,10 +203,10 @@ async fn remove_worktree(
     run_git(
         git_path,
         Some(repository_path),
-        ["worktree", "remove", "--force", &workspace_text],
+        &["worktree", "remove", "--force", &workspace_text],
     )
     .await?;
-    let _ = run_git(git_path, Some(repository_path), ["worktree", "prune"]).await;
+    let _ = run_git(git_path, Some(repository_path), &["worktree", "prune"]).await;
     Ok(())
 }
 
@@ -258,10 +261,10 @@ fn validate_commit(value: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-async fn run_git<const N: usize>(
+async fn run_git(
     git_path: &Path,
     cwd: Option<&Path>,
-    args: [&str; N],
+    args: &[&str],
 ) -> Result<Output, ToolError> {
     let mut command = Command::new(git_path);
     command.args(args).kill_on_drop(true);
