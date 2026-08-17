@@ -80,9 +80,7 @@ pub(crate) async fn call(tool: &str, arguments: Option<JsonValue>) -> McpServerT
     }
 }
 
-fn decode_args<T: for<'de> Deserialize<'de>>(
-    arguments: Option<JsonValue>,
-) -> Result<T, ToolError> {
+fn decode_args<T: for<'de> Deserialize<'de>>(arguments: Option<JsonValue>) -> Result<T, ToolError> {
     serde_json::from_value(arguments.unwrap_or_else(|| json!({}))).map_err(|error| {
         tool_error(
             "CWAPI_TOOL_ARGUMENTS_INVALID",
@@ -133,12 +131,8 @@ async fn workspace_open(args: WorkspaceOpenArgs) -> Result<WorkspaceResult, Tool
     match workspace_result(&args.git_path, &args.workspace_path, &args.expected_commit).await {
         Ok(result) => Ok(result),
         Err(error) => {
-            let _ = remove_worktree(
-                &args.git_path,
-                &args.repository_path,
-                &args.workspace_path,
-            )
-            .await;
+            let _ =
+                remove_worktree(&args.git_path, &args.repository_path, &args.workspace_path).await;
             Err(error)
         }
     }
@@ -261,11 +255,7 @@ fn validate_commit(value: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-async fn run_git(
-    git_path: &Path,
-    cwd: Option<&Path>,
-    args: &[&str],
-) -> Result<Output, ToolError> {
+async fn run_git(git_path: &Path, cwd: Option<&Path>, args: &[&str]) -> Result<Output, ToolError> {
     let mut command = Command::new(git_path);
     command.args(args).kill_on_drop(true);
     if let Some(cwd) = cwd {
