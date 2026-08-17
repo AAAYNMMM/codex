@@ -44,6 +44,15 @@ foreach ($fragment in $requiredProcessorFragments) {
     }
 }
 
+$specialRouteIndex = $processorText.IndexOf('if params.server == cwapi_dev_mcp::SERVER_NAME')
+$genericThreadLoadIndex = $processorText.IndexOf('self.load_thread(&thread_id).await?')
+if ($genericThreadLoadIndex -lt 0) {
+    throw 'Missing generic MCP thread loading path; validation assumptions need to be updated.'
+}
+if ($specialRouteIndex -gt $genericThreadLoadIndex) {
+    throw 'cwapi-dev routing must return before the generic MCP thread loading path.'
+}
+
 $requiredToolFragments = @(
     'pub(crate) const SERVER_NAME: &str = "cwapi-dev";',
     '"workspace.open"',
@@ -61,7 +70,8 @@ $forbiddenToolFragments = @(
     'thread/start',
     'turn/start',
     'shell.exec',
-    'local_command'
+    'local_command',
+    '"modelTurnStarted": true'
 )
 foreach ($fragment in $forbiddenToolFragments) {
     if ($toolText.Contains($fragment)) {
