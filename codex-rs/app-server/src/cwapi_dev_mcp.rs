@@ -200,23 +200,15 @@ async fn workspace_close(args: WorkspaceCloseArgs) -> Result<JsonValue, ToolErro
 
 async fn git_rev_parse(args: WorkspaceGitArgs) -> Result<GitRevParseResult, ToolError> {
     let workspace_path = validate_git_workspace(&args)?;
-    let actual_commit = exact_workspace_commit(
-        &args.git_path,
-        &workspace_path,
-        &args.expected_commit,
-    )
-    .await?;
+    let actual_commit =
+        exact_workspace_commit(&args.git_path, &workspace_path, &args.expected_commit).await?;
     Ok(GitRevParseResult { actual_commit })
 }
 
 async fn git_status(args: WorkspaceGitArgs) -> Result<GitStatusResult, ToolError> {
     let workspace_path = validate_git_workspace(&args)?;
-    let actual_commit = exact_workspace_commit(
-        &args.git_path,
-        &workspace_path,
-        &args.expected_commit,
-    )
-    .await?;
+    let actual_commit =
+        exact_workspace_commit(&args.git_path, &workspace_path, &args.expected_commit).await?;
     let status = run_git(
         &args.git_path,
         Some(&workspace_path),
@@ -400,7 +392,11 @@ fn bounded_stdout(value: &[u8], limit: usize) -> Result<String, ToolError> {
         ));
     }
     String::from_utf8(value.to_vec())
-        .map(|value| value.trim_end_matches(|c| c == '\r' || c == '\n').to_string())
+        .map(|value| {
+            value
+                .trim_end_matches(|c| c == '\r' || c == '\n')
+                .to_string()
+        })
         .map_err(|_| tool_error("CWAPI_GIT_OUTPUT_INVALID", "Git stdout was not UTF-8"))
 }
 
