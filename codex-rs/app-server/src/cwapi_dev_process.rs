@@ -44,8 +44,7 @@ pub(super) struct ProcessResult {
 pub(super) async fn test_run(arguments: Option<JsonValue>) -> Result<ProcessResult, ToolError> {
     let args = decode_args(arguments)?;
     let workspace = validate_process_workspace(&args)?;
-    let actual_commit =
-        exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
+    exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
     let (program, argv): (&str, &[&str]) = match args.profile.as_str() {
         "go.all" => ("go", &["test", "./..."]),
         "cargo.workspace" => ("cargo", &["test", "--workspace", "--no-fail-fast"]),
@@ -58,6 +57,8 @@ pub(super) async fn test_run(arguments: Option<JsonValue>) -> Result<ProcessResu
         }
     };
     run_profile(program, argv, &workspace, "CWAPI_TEST").await?;
+    let actual_commit =
+        exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
     Ok(ProcessResult {
         actual_commit,
         profile: args.profile,
@@ -68,8 +69,7 @@ pub(super) async fn test_run(arguments: Option<JsonValue>) -> Result<ProcessResu
 pub(super) async fn build_run(arguments: Option<JsonValue>) -> Result<ProcessResult, ToolError> {
     let args = decode_args(arguments)?;
     let workspace = validate_process_workspace(&args)?;
-    let actual_commit =
-        exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
+    exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
     let (program, argv): (&str, &[&str]) = match args.profile.as_str() {
         "go.all" => ("go", &["build", "./..."]),
         "cargo.workspace" => ("cargo", &["build", "--workspace"]),
@@ -81,6 +81,8 @@ pub(super) async fn build_run(arguments: Option<JsonValue>) -> Result<ProcessRes
         }
     };
     run_profile(program, argv, &workspace, "CWAPI_BUILD").await?;
+    let actual_commit =
+        exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
     Ok(ProcessResult {
         actual_commit,
         profile: args.profile,
