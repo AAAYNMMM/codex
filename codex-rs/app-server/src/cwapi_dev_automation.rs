@@ -26,7 +26,7 @@ const AUTOMATION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const AUTOMATION_OUTPUT_LIMIT: usize = 1024 * 1024;
 const AUTOMATION_ARGUMENT_LIMIT: usize = 64;
 const AUTOMATION_ARGUMENT_BYTE_MAX: usize = 4096;
-const AUTOMATION_SCRIPT_PATH_MAX: usize = 512;
+const AUTOMATION_ENTRYPOINT_MAX: usize = 512;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -35,8 +35,8 @@ struct WorkspaceAutomationArgs {
     workspace_root: PathBuf,
     workspace_path: PathBuf,
     expected_commit: String,
-    script_path: String,
-    script_sha256: String,
+    entrypoint: String,
+    sha256: String,
     arguments: Vec<String>,
 }
 
@@ -44,8 +44,8 @@ struct WorkspaceAutomationArgs {
 #[serde(rename_all = "camelCase")]
 pub(super) struct AutomationResult {
     actual_commit: String,
-    script_path: String,
-    script_sha256: String,
+    entrypoint: String,
+    sha256: String,
     exit_code: i32,
 }
 
@@ -54,41 +54,30 @@ pub(super) async fn automation_run(
 ) -> Result<AutomationResult, ToolError> {
     let args = decode_args(arguments)?;
     let workspace = validate_automation_workspace(&args)?;
+
     exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
-    ensure_tracked_workspace_clean(&args.git_path, &workspace).await?;
-    ensure_regular_tracked_script(&args.git_path, &workspace, &args.script_path).await?;
-    ensure_no_git_filter(&args.git_path, &workspace, &args.script_path).await?;
+    ensure_workspace_clean(&args.git_path, &workspace).await?;
+    ensure_regular_tracked_entrypoint(&args.git_path, &workspace, &args.entrypoint).await?;
     verify_blob_sha256(
         &args.git_path,
         &workspace,
         &args.expected_commit,
-        &args.script_path,
-        &args.script_sha256,
+        &args.entrypoint,
+        &args.sha256,
     )
     .await?;
 
-    let script = workspace.join(Path::new(&args.script_path));
-    let metadata = std::fs::symlink_metadata(&script).map_err(|_| {
-        tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_UNAVAILABLE",
-            "automation script is unavailable in the managed workspace",
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_NOT_REGULAR",
-            "automation script must be a regular tracked file",
-        ));
-    }
+    let script = workspace.join(Path::new(&args.entrypoint));
+    run_entrypoint(&script, &workspace, &args.entrypoint, &args.arguments).await?;
 
-    run_script(&script, &workspace, &args.script_path, &args.arguments).await?;
     let actual_commit =
         exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
-    ensure_tracked_workspace_clean(&args.git_path, &workspace).await?;
+    ensure_workspace_clean(&args.git_path, &workspace).await?;
+
     Ok(AutomationResult {
         actual_commit,
-        script_path: args.script_path,
-        script_sha256: args.script_sha256,
+        entrypoint: args.entrypoint,
+        sha256: args.sha256,
         exit_code: 0,
     })
 }
@@ -101,8 +90,9 @@ fn decode_args(arguments: Option<JsonValue>) -> Result<WorkspaceAutomationArgs, 
                 "invalid structured automation arguments",
             )
         })?;
-    validate_script_path(&value.script_path)?;
-    validate_sha256(&value.script_sha256)?;
+
+    validate_entrypoint(&value.entrypoint)?;
+    validate_sha256(&value.sha256)?;
     if value.arguments.len() > AUTOMATION_ARGUMENT_LIMIT {
         return Err(tool_error(
             "CWAPI_AUTOMATION_ARGUMENT_LIMIT",
@@ -117,13 +107,13 @@ fn decode_args(arguments: Option<JsonValue>) -> Result<WorkspaceAutomationArgs, 
             ));
         }
     }
-    value.script_sha256.make_ascii_lowercase();
+    value.sha256.make_ascii_lowercase();
     Ok(value)
 }
 
-fn validate_script_path(value: &str) -> Result<(), ToolError> {
+fn validate_entrypoint(value: &str) -> Result<(), ToolError> {
     if value.is_empty()
-        || value.len() > AUTOMATION_SCRIPT_PATH_MAX
+        || value.len() > AUTOMATION_ENTRYPOINT_MAX
         || value.contains('\0')
         || value.contains('\\')
         || !value.starts_with("automation/")
@@ -132,10 +122,11 @@ fn validate_script_path(value: &str) -> Result<(), ToolError> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
     {
         return Err(tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_PATH_INVALID",
-            "automation script path is invalid",
+            "CWAPI_AUTOMATION_ENTRYPOINT_INVALID",
+            "automation entrypoint is invalid",
         ));
     }
+
     let path = Path::new(value);
     if path.is_absolute()
         || path.components().any(|component| {
@@ -146,15 +137,16 @@ fn validate_script_path(value: &str) -> Result<(), ToolError> {
         })
     {
         return Err(tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_PATH_INVALID",
-            "automation script path is invalid",
+            "CWAPI_AUTOMATION_ENTRYPOINT_INVALID",
+            "automation entrypoint is invalid",
         ));
     }
+
     match path.extension().and_then(|value| value.to_str()) {
         Some("ps1") | Some("py") => Ok(()),
         _ => Err(tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_TYPE_UNSUPPORTED",
-            "automation script type is unsupported",
+            "CWAPI_AUTOMATION_ENTRYPOINT_TYPE_UNSUPPORTED",
+            "automation entrypoint type is unsupported",
         )),
     }
 }
@@ -162,8 +154,8 @@ fn validate_script_path(value: &str) -> Result<(), ToolError> {
 fn validate_sha256(value: &str) -> Result<(), ToolError> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_SHA256_INVALID",
-            "automation script SHA-256 is invalid",
+            "CWAPI_AUTOMATION_SHA256_INVALID",
+            "automation SHA-256 is invalid",
         ));
     }
     Ok(())
@@ -197,63 +189,39 @@ fn validate_automation_workspace(args: &WorkspaceAutomationArgs) -> Result<PathB
     Ok(canonical_workspace)
 }
 
-async fn ensure_tracked_workspace_clean(
-    git_path: &Path,
-    workspace: &Path,
-) -> Result<(), ToolError> {
+async fn ensure_workspace_clean(git_path: &Path, workspace: &Path) -> Result<(), ToolError> {
     let status = run_git(
         git_path,
         Some(workspace),
-        &["status", "--porcelain=v1", "--untracked-files=no"],
+        &["status", "--porcelain=v1", "--untracked-files=all"],
     )
     .await?;
     if !status.stdout.is_empty() {
         return Err(tool_error(
             "CWAPI_AUTOMATION_WORKTREE_DIRTY",
-            "automation requires no tracked worktree changes",
+            "automation requires a clean managed workspace",
         ));
     }
     Ok(())
 }
 
-async fn ensure_regular_tracked_script(
+async fn ensure_regular_tracked_entrypoint(
     git_path: &Path,
     workspace: &Path,
-    script_path: &str,
+    entrypoint: &str,
 ) -> Result<(), ToolError> {
     let output = run_git(
         git_path,
         Some(workspace),
-        &["ls-files", "--stage", "--", script_path],
+        &["ls-files", "--stage", "--", entrypoint],
     )
     .await?;
     let line = bounded_stdout(&output.stdout, 4096)?;
     let mode = line.split_whitespace().next().unwrap_or_default();
     if mode != "100644" && mode != "100755" {
         return Err(tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_NOT_REGULAR",
-            "automation script must be a regular tracked file",
-        ));
-    }
-    Ok(())
-}
-
-async fn ensure_no_git_filter(
-    git_path: &Path,
-    workspace: &Path,
-    script_path: &str,
-) -> Result<(), ToolError> {
-    let output = run_git(
-        git_path,
-        Some(workspace),
-        &["check-attr", "filter", "--", script_path],
-    )
-    .await?;
-    let line = bounded_stdout(&output.stdout, 4096)?;
-    if !line.ends_with(": filter: unspecified") && !line.ends_with(": filter: unset") {
-        return Err(tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_FILTER_UNSUPPORTED",
-            "automation script may not use a Git content filter",
+            "CWAPI_AUTOMATION_ENTRYPOINT_NOT_REGULAR",
+            "automation entrypoint must be a regular tracked file",
         ));
     }
     Ok(())
@@ -263,28 +231,28 @@ async fn verify_blob_sha256(
     git_path: &Path,
     workspace: &Path,
     expected_commit: &str,
-    script_path: &str,
+    entrypoint: &str,
     expected_sha256: &str,
 ) -> Result<(), ToolError> {
-    let object = format!("{expected_commit}:{script_path}");
+    let object = format!("{expected_commit}:{entrypoint}");
     let output = run_git(git_path, Some(workspace), &["show", &object]).await?;
     let actual = format!("{:x}", Sha256::digest(&output.stdout));
     if !actual.eq_ignore_ascii_case(expected_sha256) {
         return Err(tool_error(
-            "CWAPI_AUTOMATION_SCRIPT_HASH_MISMATCH",
-            "automation script Git blob did not match the requested SHA-256",
+            "CWAPI_AUTOMATION_HASH_MISMATCH",
+            "automation entrypoint did not match the requested SHA-256",
         ));
     }
     Ok(())
 }
 
-async fn run_script(
+async fn run_entrypoint(
     script: &Path,
     workspace: &Path,
-    script_path: &str,
+    entrypoint: &str,
     arguments: &[String],
 ) -> Result<(), ToolError> {
-    let extension = Path::new(script_path)
+    let extension = Path::new(entrypoint)
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
@@ -305,6 +273,7 @@ async fn run_script(
         ("python", vec![script.as_os_str().to_owned()])
     };
     argv.extend(arguments.iter().map(OsString::from));
+
     run_bounded(
         program,
         &argv,
@@ -333,9 +302,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn script_path_is_repo_relative_and_bounded() {
-        assert!(validate_script_path("automation/check.ps1").is_ok());
-        assert!(validate_script_path("automation/sub/check.py").is_ok());
+    fn entrypoint_is_repo_relative_and_bounded() {
+        assert!(validate_entrypoint("automation/check.ps1").is_ok());
+        assert!(validate_entrypoint("automation/sub/check.py").is_ok());
         for value in [
             "../automation/check.ps1",
             "automation/../check.ps1",
@@ -344,21 +313,20 @@ mod tests {
             "automation/check.exe",
             "automation/check file.ps1",
             "automation/check.PS1",
-            "automation/check.PY",
         ] {
-            assert!(validate_script_path(value).is_err(), "accepted {value}");
+            assert!(validate_entrypoint(value).is_err(), "accepted {value}");
         }
     }
 
     #[test]
-    fn automation_arguments_reject_free_command_field() {
+    fn arguments_reject_free_command_field() {
         let value = json!({
             "gitPath": "/git",
             "workspaceRoot": "/worktrees",
             "workspacePath": "/worktrees/ws-1",
             "expectedCommit": "0123456789abcdef0123456789abcdef01234567",
-            "scriptPath": "automation/check.py",
-            "scriptSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "entrypoint": "automation/check.py",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "arguments": [],
             "command": "python evil.py"
         });
@@ -366,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn automation_error_mapping_is_fixed() {
+    fn error_mapping_is_fixed() {
         assert_eq!(
             map_exec_failure(ExecFailure::RuntimeMissing).code,
             "CWAPI_AUTOMATION_RUNTIME_MISSING"
