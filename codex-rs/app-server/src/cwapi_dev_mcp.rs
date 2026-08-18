@@ -13,7 +13,7 @@ use tokio::time::timeout;
 pub(crate) const SERVER_NAME: &str = "cwapi-dev";
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
-const STATUS_PORCELAIN_LIMIT: usize = 64 * 1024;
+const STATUS_PORCELAIN_LIMIT: usize = 8 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -400,7 +400,7 @@ fn bounded_stdout(value: &[u8], limit: usize) -> Result<String, ToolError> {
         ));
     }
     String::from_utf8(value.to_vec())
-        .map(|value| value.trim_end_matches(['\r', '\n']).to_string())
+        .map(|value| value.trim_end_matches(|c| c == '\r' || c == '\n').to_string())
         .map_err(|_| tool_error("CWAPI_GIT_OUTPUT_INVALID", "Git stdout was not UTF-8"))
 }
 
