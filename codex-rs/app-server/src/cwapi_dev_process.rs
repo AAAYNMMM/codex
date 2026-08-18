@@ -2,17 +2,14 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
-use std::io::ErrorKind;
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
-use tokio::time::timeout;
 
 use super::ToolError;
+use super::cwapi_dev_exec::ExecFailure;
+use super::cwapi_dev_exec::run_bounded;
 use super::exact_workspace_commit;
 use super::tool_error;
 use super::validate_commit;
@@ -133,112 +130,31 @@ async fn run_profile(
     workspace: &Path,
     error_prefix: &str,
 ) -> Result<(), ToolError> {
-    let mut command = Command::new(program);
-    command
-        .args(argv)
-        .current_dir(workspace)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            tool_error(
-                leak_static_code(error_prefix, "_RUNTIME_MISSING"),
-                "required structured process runtime is unavailable",
-            )
-        } else {
-            tool_error(
-                leak_static_code(error_prefix, "_START_FAILED"),
-                "structured process profile could not start",
-            )
-        }
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        tool_error(
-            leak_static_code(error_prefix, "_START_FAILED"),
-            "structured process stdout pipe was unavailable",
-        )
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        tool_error(
-            leak_static_code(error_prefix, "_START_FAILED"),
-            "structured process stderr pipe was unavailable",
-        )
-    })?;
-    let stdout_task = tokio::spawn(drain_bounded(stdout, PROCESS_OUTPUT_LIMIT));
-    let stderr_task = tokio::spawn(drain_bounded(stderr, PROCESS_OUTPUT_LIMIT));
+    let argv = argv.iter().map(OsString::from).collect::<Vec<_>>();
+    run_bounded(
+        program,
+        &argv,
+        workspace,
+        PROCESS_TIMEOUT,
+        PROCESS_OUTPUT_LIMIT,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|failure| map_exec_failure(error_prefix, failure))
+}
 
-    let status = match timeout(PROCESS_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(_)) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            return Err(tool_error(
-                leak_static_code(error_prefix, "_FAILED"),
-                "structured process profile wait failed",
-            ));
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            return Err(tool_error(
-                leak_static_code(error_prefix, "_TIMED_OUT"),
-                "structured process profile timed out",
-            ));
-        }
+fn map_exec_failure(error_prefix: &str, failure: ExecFailure) -> ToolError {
+    let suffix = match failure {
+        ExecFailure::RuntimeMissing => "_RUNTIME_MISSING",
+        ExecFailure::StartFailed => "_START_FAILED",
+        ExecFailure::TimedOut => "_TIMED_OUT",
+        ExecFailure::OutputTooLarge => "_OUTPUT_TOO_LARGE",
+        ExecFailure::Failed => "_FAILED",
     };
-
-    let stdout_overflow = reader_overflow(stdout_task, error_prefix).await?;
-    let stderr_overflow = reader_overflow(stderr_task, error_prefix).await?;
-    if stdout_overflow || stderr_overflow {
-        return Err(tool_error(
-            leak_static_code(error_prefix, "_OUTPUT_TOO_LARGE"),
-            "structured process profile exceeded bounded output",
-        ));
-    }
-    if !status.success() {
-        return Err(tool_error(
-            leak_static_code(error_prefix, "_FAILED"),
-            "structured process profile failed",
-        ));
-    }
-    Ok(())
-}
-
-async fn drain_bounded<R>(mut reader: R, limit: usize) -> std::io::Result<bool>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut total = 0usize;
-    let mut overflow = false;
-    let mut buffer = [0u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            return Ok(overflow);
-        }
-        total = total.saturating_add(read);
-        if total > limit {
-            overflow = true;
-        }
-    }
-}
-
-async fn reader_overflow(
-    task: tokio::task::JoinHandle<std::io::Result<bool>>,
-    error_prefix: &str,
-) -> Result<bool, ToolError> {
-    match task.await {
-        Ok(Ok(overflow)) => Ok(overflow),
-        _ => Err(tool_error(
-            leak_static_code(error_prefix, "_FAILED"),
-            "structured process output drain failed",
-        )),
-    }
+    tool_error(
+        leak_static_code(error_prefix, suffix),
+        "structured process profile failed",
+    )
 }
 
 fn leak_static_code(prefix: &str, suffix: &str) -> &'static str {
@@ -260,7 +176,6 @@ fn leak_static_code(prefix: &str, suffix: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn process_arguments_reject_free_command_fields() {
@@ -289,16 +204,5 @@ mod tests {
             leak_static_code("invalid", "invalid"),
             "CWAPI_PROCESS_FAILED"
         );
-    }
-
-    #[tokio::test]
-    async fn output_drain_reports_overflow_without_buffering_the_stream() {
-        let (mut writer, reader) = tokio::io::duplex(32);
-        let write = tokio::spawn(async move {
-            writer.write_all(&vec![b'x'; 128]).await.unwrap();
-        });
-        let overflow = drain_bounded(reader, 64).await.unwrap();
-        write.await.unwrap();
-        assert!(overflow);
     }
 }
