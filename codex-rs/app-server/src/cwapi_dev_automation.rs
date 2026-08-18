@@ -67,8 +67,10 @@ pub(super) async fn automation_run(
     )
     .await?;
 
-    let script = workspace.join(Path::new(&args.entrypoint));
+    let script = validate_execution_entrypoint(&workspace, &args.entrypoint)?;
+    verify_worktree_sha256(&script, &args.sha256)?;
     run_entrypoint(&script, &workspace, &args.entrypoint, &args.arguments).await?;
+    verify_worktree_sha256(&script, &args.sha256)?;
 
     let actual_commit =
         exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
@@ -246,6 +248,52 @@ async fn verify_blob_sha256(
     Ok(())
 }
 
+fn validate_execution_entrypoint(workspace: &Path, entrypoint: &str) -> Result<PathBuf, ToolError> {
+    let requested = workspace.join(Path::new(entrypoint));
+    let metadata = std::fs::symlink_metadata(&requested).map_err(|_| {
+        tool_error(
+            "CWAPI_AUTOMATION_ENTRYPOINT_UNAVAILABLE",
+            "automation entrypoint is unavailable in the managed workspace",
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(tool_error(
+            "CWAPI_AUTOMATION_ENTRYPOINT_NOT_REGULAR",
+            "automation entrypoint must remain a regular file in the managed workspace",
+        ));
+    }
+    let canonical = std::fs::canonicalize(&requested).map_err(|_| {
+        tool_error(
+            "CWAPI_AUTOMATION_ENTRYPOINT_UNAVAILABLE",
+            "automation entrypoint could not be canonicalized",
+        )
+    })?;
+    if !canonical.starts_with(workspace) {
+        return Err(tool_error(
+            "CWAPI_AUTOMATION_ENTRYPOINT_ESCAPE",
+            "automation entrypoint escaped the managed workspace",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn verify_worktree_sha256(script: &Path, expected_sha256: &str) -> Result<(), ToolError> {
+    let bytes = std::fs::read(script).map_err(|_| {
+        tool_error(
+            "CWAPI_AUTOMATION_ENTRYPOINT_UNAVAILABLE",
+            "automation entrypoint could not be read from the managed workspace",
+        )
+    })?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        return Err(tool_error(
+            "CWAPI_AUTOMATION_WORKTREE_HASH_MISMATCH",
+            "checked-out automation bytes differ from the canonical Git blob",
+        ));
+    }
+    Ok(())
+}
+
 async fn run_entrypoint(
     script: &Path,
     workspace: &Path,
@@ -331,6 +379,16 @@ mod tests {
             "command": "python evil.py"
         });
         assert!(serde_json::from_value::<WorkspaceAutomationArgs>(value).is_err());
+    }
+
+    #[test]
+    fn worktree_hash_must_match_requested_blob_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("check.py");
+        std::fs::write(&script, b"print('ok')\n").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"print('ok')\n"));
+        assert!(verify_worktree_sha256(&script, &hash).is_ok());
+        assert!(verify_worktree_sha256(&script, &"0".repeat(64)).is_err());
     }
 
     #[test]
