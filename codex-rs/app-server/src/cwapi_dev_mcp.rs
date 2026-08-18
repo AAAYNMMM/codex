@@ -10,6 +10,10 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+#[path = "cwapi_dev_automation.rs"]
+mod cwapi_dev_automation;
+#[path = "cwapi_dev_exec.rs"]
+mod cwapi_dev_exec;
 #[path = "cwapi_dev_process.rs"]
 mod cwapi_dev_process;
 
@@ -119,6 +123,10 @@ pub(crate) async fn call(tool: &str, arguments: Option<JsonValue>) -> McpServerT
             Err(error) => error_response(error),
         },
         "build.run" => match cwapi_dev_process::build_run(arguments).await {
+            Ok(value) => success_response(value),
+            Err(error) => error_response(error),
+        },
+        "automation.run" => match cwapi_dev_automation::automation_run(arguments).await {
             Ok(value) => success_response(value),
             Err(error) => error_response(error),
         },
