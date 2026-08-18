@@ -81,7 +81,7 @@ pub(super) async fn automation_run(
         ));
     }
 
-    run_script(&script, &args.script_path, &args.arguments).await?;
+    run_script(&script, &workspace, &args.script_path, &args.arguments).await?;
     let actual_commit =
         exact_workspace_commit(&args.git_path, &workspace, &args.expected_commit).await?;
     ensure_tracked_workspace_clean(&args.git_path, &workspace).await?;
@@ -151,7 +151,7 @@ fn validate_script_path(value: &str) -> Result<(), ToolError> {
         ));
     }
     match path.extension().and_then(|value| value.to_str()) {
-        Some(extension) if extension.eq_ignore_ascii_case("ps1") || extension.eq_ignore_ascii_case("py") => Ok(()),
+        Some("ps1") | Some("py") => Ok(()),
         _ => Err(tool_error(
             "CWAPI_AUTOMATION_SCRIPT_TYPE_UNSUPPORTED",
             "automation script type is unsupported",
@@ -280,6 +280,7 @@ async fn verify_blob_sha256(
 
 async fn run_script(
     script: &Path,
+    workspace: &Path,
     script_path: &str,
     arguments: &[String],
 ) -> Result<(), ToolError> {
@@ -287,7 +288,7 @@ async fn run_script(
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    let (program, mut argv) = if extension.eq_ignore_ascii_case("ps1") {
+    let (program, mut argv) = if extension == "ps1" {
         (
             "pwsh",
             vec![
@@ -307,7 +308,7 @@ async fn run_script(
     run_bounded(
         program,
         &argv,
-        script.parent().unwrap_or_else(|| Path::new(".")),
+        workspace,
         AUTOMATION_TIMEOUT,
         AUTOMATION_OUTPUT_LIMIT,
     )
@@ -342,6 +343,8 @@ mod tests {
             "scripts/check.ps1",
             "automation/check.exe",
             "automation/check file.ps1",
+            "automation/check.PS1",
+            "automation/check.PY",
         ] {
             assert!(validate_script_path(value).is_err(), "accepted {value}");
         }
