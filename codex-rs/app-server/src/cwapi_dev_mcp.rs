@@ -13,6 +13,7 @@ use tokio::time::timeout;
 pub(crate) const SERVER_NAME: &str = "cwapi-dev";
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
+const STATUS_PORCELAIN_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -42,12 +43,35 @@ struct WorkspaceCloseArgs {
     workspace_path: PathBuf,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WorkspaceGitArgs {
+    git_path: PathBuf,
+    workspace_root: PathBuf,
+    workspace_path: PathBuf,
+    expected_commit: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceResult {
     actual_commit: String,
     clean: bool,
     workspace_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitRevParseResult {
+    actual_commit: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitStatusResult {
+    actual_commit: String,
+    clean: bool,
+    porcelain: String,
 }
 
 pub(crate) async fn call(tool: &str, arguments: Option<JsonValue>) -> McpServerToolCallResponse {
@@ -68,6 +92,20 @@ pub(crate) async fn call(tool: &str, arguments: Option<JsonValue>) -> McpServerT
         },
         "workspace.close" => match decode_args::<WorkspaceCloseArgs>(arguments) {
             Ok(args) => match workspace_close(args).await {
+                Ok(value) => success_response(value),
+                Err(error) => error_response(error),
+            },
+            Err(error) => error_response(error),
+        },
+        "git.rev_parse" => match decode_args::<WorkspaceGitArgs>(arguments) {
+            Ok(args) => match git_rev_parse(args).await {
+                Ok(value) => success_response(value),
+                Err(error) => error_response(error),
+            },
+            Err(error) => error_response(error),
+        },
+        "git.status" => match decode_args::<WorkspaceGitArgs>(arguments) {
+            Ok(args) => match git_status(args).await {
                 Ok(value) => success_response(value),
                 Err(error) => error_response(error),
             },
@@ -160,11 +198,72 @@ async fn workspace_close(args: WorkspaceCloseArgs) -> Result<JsonValue, ToolErro
     }))
 }
 
-async fn workspace_result(
+async fn git_rev_parse(args: WorkspaceGitArgs) -> Result<GitRevParseResult, ToolError> {
+    let workspace_path = validate_git_workspace(&args)?;
+    let actual_commit = exact_workspace_commit(
+        &args.git_path,
+        &workspace_path,
+        &args.expected_commit,
+    )
+    .await?;
+    Ok(GitRevParseResult { actual_commit })
+}
+
+async fn git_status(args: WorkspaceGitArgs) -> Result<GitStatusResult, ToolError> {
+    let workspace_path = validate_git_workspace(&args)?;
+    let actual_commit = exact_workspace_commit(
+        &args.git_path,
+        &workspace_path,
+        &args.expected_commit,
+    )
+    .await?;
+    let status = run_git(
+        &args.git_path,
+        Some(&workspace_path),
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .await?;
+    let porcelain = bounded_stdout(&status.stdout, STATUS_PORCELAIN_LIMIT)?;
+    Ok(GitStatusResult {
+        actual_commit,
+        clean: porcelain.is_empty(),
+        porcelain,
+    })
+}
+
+fn validate_git_workspace(args: &WorkspaceGitArgs) -> Result<PathBuf, ToolError> {
+    validate_git_path(&args.git_path)?;
+    validate_commit(&args.expected_commit)?;
+    validate_workspace_member(&args.workspace_root, &args.workspace_path)?;
+    validate_existing_directory(&args.workspace_root, "workspaceRoot")?;
+    validate_existing_directory(&args.workspace_path, "workspacePath")?;
+
+    let canonical_root = std::fs::canonicalize(&args.workspace_root).map_err(|error| {
+        tool_error(
+            "CWAPI_WORKSPACE_PATH_INVALID",
+            format!("workspaceRoot could not be canonicalized: {error}"),
+        )
+    })?;
+    let canonical_workspace = std::fs::canonicalize(&args.workspace_path).map_err(|error| {
+        tool_error(
+            "CWAPI_WORKSPACE_PATH_INVALID",
+            format!("workspacePath could not be canonicalized: {error}"),
+        )
+    })?;
+    if canonical_workspace.parent() != Some(canonical_root.as_path()) {
+        return Err(tool_error(
+            "CWAPI_WORKSPACE_PATH_INVALID",
+            "workspacePath must remain a direct child of workspaceRoot after canonicalization",
+        ));
+    }
+    Ok(canonical_workspace)
+}
+
+async fn exact_workspace_commit(
     git_path: &Path,
     workspace_path: &Path,
     expected_commit: &str,
-) -> Result<WorkspaceResult, ToolError> {
+) -> Result<String, ToolError> {
     let head = run_git(git_path, Some(workspace_path), &["rev-parse", "HEAD"]).await?;
     let actual_commit = stdout_line(&head)?;
     if !actual_commit.eq_ignore_ascii_case(expected_commit) {
@@ -173,6 +272,15 @@ async fn workspace_result(
             format!("expected {expected_commit}, actual {actual_commit}"),
         ));
     }
+    Ok(actual_commit)
+}
+
+async fn workspace_result(
+    git_path: &Path,
+    workspace_path: &Path,
+    expected_commit: &str,
+) -> Result<WorkspaceResult, ToolError> {
+    let actual_commit = exact_workspace_commit(git_path, workspace_path, expected_commit).await?;
     let status = run_git(git_path, Some(workspace_path), &["status", "--porcelain"]).await?;
     let clean = status.stdout.is_empty();
     if !clean {
@@ -281,8 +389,18 @@ async fn run_git(git_path: &Path, cwd: Option<&Path>, args: &[&str]) -> Result<O
 }
 
 fn stdout_line(output: &Output) -> Result<String, ToolError> {
-    String::from_utf8(output.stdout.clone())
-        .map(|value| value.trim().to_string())
+    bounded_stdout(&output.stdout, OUTPUT_LIMIT).map(|value| value.trim().to_string())
+}
+
+fn bounded_stdout(value: &[u8], limit: usize) -> Result<String, ToolError> {
+    if value.len() > limit {
+        return Err(tool_error(
+            "CWAPI_GIT_OUTPUT_TOO_LARGE",
+            "structured Git output exceeded tool result limit",
+        ));
+    }
+    String::from_utf8(value.to_vec())
+        .map(|value| value.trim_end_matches(['\r', '\n']).to_string())
         .map_err(|_| tool_error("CWAPI_GIT_OUTPUT_INVALID", "Git stdout was not UTF-8"))
 }
 
@@ -356,5 +474,26 @@ mod tests {
         };
         assert!(validate_workspace_member(&root, &root.join("ws-1")).is_ok());
         assert!(validate_workspace_member(&root, &root.join("nested").join("ws-1")).is_err());
+    }
+
+    #[test]
+    fn git_args_reject_backend_field_injection() {
+        let value = json!({
+            "gitPath": "/git",
+            "workspaceRoot": "/worktrees",
+            "workspacePath": "/worktrees/ws-1",
+            "expectedCommit": "0123456789abcdef0123456789abcdef01234567",
+            "command": "status"
+        });
+        assert!(serde_json::from_value::<WorkspaceGitArgs>(value).is_err());
+    }
+
+    #[test]
+    fn status_output_is_bounded() {
+        let exact = vec![b'x'; STATUS_PORCELAIN_LIMIT];
+        assert!(bounded_stdout(&exact, STATUS_PORCELAIN_LIMIT).is_ok());
+        let oversized = vec![b'x'; STATUS_PORCELAIN_LIMIT + 1];
+        let error = bounded_stdout(&oversized, STATUS_PORCELAIN_LIMIT).unwrap_err();
+        assert_eq!(error.code, "CWAPI_GIT_OUTPUT_TOO_LARGE");
     }
 }
