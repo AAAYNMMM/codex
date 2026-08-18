@@ -10,6 +10,9 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+#[path = "cwapi_dev_process.rs"]
+mod cwapi_dev_process;
+
 pub(crate) const SERVER_NAME: &str = "cwapi-dev";
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -109,6 +112,14 @@ pub(crate) async fn call(tool: &str, arguments: Option<JsonValue>) -> McpServerT
                 Ok(value) => success_response(value),
                 Err(error) => error_response(error),
             },
+            Err(error) => error_response(error),
+        },
+        "test.run" => match cwapi_dev_process::test_run(arguments).await {
+            Ok(value) => success_response(value),
+            Err(error) => error_response(error),
+        },
+        "build.run" => match cwapi_dev_process::build_run(arguments).await {
+            Ok(value) => success_response(value),
             Err(error) => error_response(error),
         },
         _ => error_response(tool_error(
