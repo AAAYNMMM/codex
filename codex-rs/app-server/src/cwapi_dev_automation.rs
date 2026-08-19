@@ -17,7 +17,6 @@ use super::cwapi_dev_exec::run_bounded_cancellable_to_files;
 use super::exact_workspace_commit;
 use super::run_git;
 use super::tool_error;
-use super::tool_error_with_resources;
 use super::validate_commit;
 use super::validate_existing_directory;
 use super::validate_git_path;
@@ -29,7 +28,6 @@ mod cwapi_dev_cancel;
 mod cwapi_dev_output;
 use cwapi_dev_cancel::begin_execution;
 use cwapi_dev_cancel::request_cancel;
-use cwapi_dev_output::OutputResource;
 use cwapi_dev_output::output_resources;
 use cwapi_dev_output::prepare_output_paths;
 
@@ -87,7 +85,7 @@ pub(super) async fn automation_run(arguments: Option<JsonValue>) -> Result<JsonV
             "automation output resource directory is unavailable",
         )
     })?;
-    let execution = run_entrypoint(
+    if let Err(failure) = run_entrypoint(
         &script,
         &workspace,
         &args.entrypoint,
@@ -96,16 +94,16 @@ pub(super) async fn automation_run(arguments: Option<JsonValue>) -> Result<JsonV
         &output_paths.stderr,
         lease.token(),
     )
-    .await;
+    .await
+    {
+        return Err(map_exec_failure(failure));
+    }
     let resources = output_resources(&output_paths).map_err(|_| {
         tool_error(
             "CWAPI_AUTOMATION_RESOURCE_UNAVAILABLE",
             "automation output resource metadata is unavailable",
         )
     })?;
-    if let Err(failure) = execution {
-        return Err(map_exec_failure(failure, resources));
-    }
     verify_worktree_sha256(&script, &args.sha256)?;
 
     let actual_commit =
@@ -381,7 +379,7 @@ async fn run_entrypoint(
     .map(|_| ())
 }
 
-fn map_exec_failure(failure: ExecFailure, resources: Vec<OutputResource>) -> ToolError {
+fn map_exec_failure(failure: ExecFailure) -> ToolError {
     let code = match failure {
         ExecFailure::RuntimeMissing => "CWAPI_AUTOMATION_RUNTIME_MISSING",
         ExecFailure::StartFailed => "CWAPI_AUTOMATION_START_FAILED",
@@ -390,11 +388,7 @@ fn map_exec_failure(failure: ExecFailure, resources: Vec<OutputResource>) -> Too
         ExecFailure::OutputTooLarge => "CWAPI_AUTOMATION_OUTPUT_TOO_LARGE",
         ExecFailure::Failed => "CWAPI_AUTOMATION_FAILED",
     };
-    let resources = resources
-        .into_iter()
-        .filter_map(|resource| serde_json::to_value(resource).ok())
-        .collect();
-    tool_error_with_resources(code, "hash-bound automation execution failed", resources)
+    tool_error(code, "hash-bound automation execution failed")
 }
 
 #[cfg(test)]
@@ -447,21 +441,16 @@ mod tests {
 
     #[test]
     fn error_mapping_is_fixed() {
-        let resource = OutputResource {
-            kind: "stdout",
-            sha256: "a".repeat(64),
-            size_bytes: 0,
-        };
         assert_eq!(
-            map_exec_failure(ExecFailure::RuntimeMissing, vec![resource.clone()]).code,
+            map_exec_failure(ExecFailure::RuntimeMissing).code,
             "CWAPI_AUTOMATION_RUNTIME_MISSING"
         );
         assert_eq!(
-            map_exec_failure(ExecFailure::Cancelled, vec![resource.clone()]).code,
+            map_exec_failure(ExecFailure::Cancelled).code,
             "CWAPI_AUTOMATION_CANCELLED"
         );
         assert_eq!(
-            map_exec_failure(ExecFailure::OutputTooLarge, vec![resource]).code,
+            map_exec_failure(ExecFailure::OutputTooLarge).code,
             "CWAPI_AUTOMATION_OUTPUT_TOO_LARGE"
         );
     }
