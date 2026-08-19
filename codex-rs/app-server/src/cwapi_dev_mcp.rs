@@ -7,13 +7,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
-use tokio::process::Command;
-use tokio::time::timeout;
 
 #[path = "cwapi_dev_automation.rs"]
 mod cwapi_dev_automation;
 #[path = "cwapi_dev_exec.rs"]
 mod cwapi_dev_exec;
+#[path = "cwapi_dev_git.rs"]
+mod cwapi_dev_git;
 #[path = "cwapi_dev_process.rs"]
 mod cwapi_dev_process;
 
@@ -375,15 +375,15 @@ fn validate_commit(value: &str) -> Result<(), ToolError> {
 }
 
 async fn run_git(git_path: &Path, cwd: Option<&Path>, args: &[&str]) -> Result<Output, ToolError> {
-    let mut command = Command::new(git_path);
-    command.args(args).kill_on_drop(true);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    let output = timeout(TOOL_TIMEOUT, command.output())
+    let output = cwapi_dev_git::run(git_path, cwd, args, TOOL_TIMEOUT)
         .await
-        .map_err(|_| tool_error("CWAPI_GIT_TIMEOUT", "structured Git operation timed out"))?
-        .map_err(|error| tool_error("CWAPI_GIT_START_FAILED", error.to_string()))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                tool_error("CWAPI_GIT_TIMEOUT", error.to_string())
+            } else {
+                tool_error("CWAPI_GIT_START_FAILED", error.to_string())
+            }
+        })?;
     if output.stdout.len() > OUTPUT_LIMIT || output.stderr.len() > OUTPUT_LIMIT {
         return Err(tool_error(
             "CWAPI_GIT_OUTPUT_TOO_LARGE",
