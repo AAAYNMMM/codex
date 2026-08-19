@@ -166,6 +166,9 @@ mod tests {
     fn owned_tree_termination_uses_system_taskkill() {
         let path = windows_taskkill_path().expect("SystemRoot taskkill.exe must exist");
         assert!(path.is_absolute());
-        assert_eq!(path.file_name().and_then(|value| value.to_str()), Some("taskkill.exe"));
+        assert_eq!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some("taskkill.exe")
+        );
     }
 }
