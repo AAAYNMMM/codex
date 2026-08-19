@@ -148,6 +148,7 @@ fn map_exec_failure(error_prefix: &str, failure: ExecFailure) -> ToolError {
         ExecFailure::RuntimeMissing => "_RUNTIME_MISSING",
         ExecFailure::StartFailed => "_START_FAILED",
         ExecFailure::TimedOut => "_TIMED_OUT",
+        ExecFailure::Cancelled => "_CANCELLED",
         ExecFailure::OutputTooLarge => "_OUTPUT_TOO_LARGE",
         ExecFailure::Failed => "_FAILED",
     };
@@ -160,11 +161,13 @@ fn map_exec_failure(error_prefix: &str, failure: ExecFailure) -> ToolError {
 fn leak_static_code(prefix: &str, suffix: &str) -> &'static str {
     match (prefix, suffix) {
         ("CWAPI_TEST", "_TIMED_OUT") => "CWAPI_TEST_TIMED_OUT",
+        ("CWAPI_TEST", "_CANCELLED") => "CWAPI_TEST_CANCELLED",
         ("CWAPI_TEST", "_RUNTIME_MISSING") => "CWAPI_TEST_RUNTIME_MISSING",
         ("CWAPI_TEST", "_START_FAILED") => "CWAPI_TEST_START_FAILED",
         ("CWAPI_TEST", "_OUTPUT_TOO_LARGE") => "CWAPI_TEST_OUTPUT_TOO_LARGE",
         ("CWAPI_TEST", "_FAILED") => "CWAPI_TEST_FAILED",
         ("CWAPI_BUILD", "_TIMED_OUT") => "CWAPI_BUILD_TIMED_OUT",
+        ("CWAPI_BUILD", "_CANCELLED") => "CWAPI_BUILD_CANCELLED",
         ("CWAPI_BUILD", "_RUNTIME_MISSING") => "CWAPI_BUILD_RUNTIME_MISSING",
         ("CWAPI_BUILD", "_START_FAILED") => "CWAPI_BUILD_START_FAILED",
         ("CWAPI_BUILD", "_OUTPUT_TOO_LARGE") => "CWAPI_BUILD_OUTPUT_TOO_LARGE",
@@ -195,6 +198,10 @@ mod tests {
         assert_eq!(
             leak_static_code("CWAPI_TEST", "_FAILED"),
             "CWAPI_TEST_FAILED"
+        );
+        assert_eq!(
+            leak_static_code("CWAPI_TEST", "_CANCELLED"),
+            "CWAPI_TEST_CANCELLED"
         );
         assert_eq!(
             leak_static_code("CWAPI_BUILD", "_RUNTIME_MISSING"),
