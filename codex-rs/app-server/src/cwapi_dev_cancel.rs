@@ -101,11 +101,17 @@ pub(super) fn begin_execution(execution_id: &str) -> Result<ExecutionLease, Tool
     }
 
     let token = CancellationToken::new();
-    if let Some(index) = registry.pending.iter().position(|value| value == execution_id) {
+    if let Some(index) = registry
+        .pending
+        .iter()
+        .position(|value| value == execution_id)
+    {
         registry.pending.remove(index);
         token.cancel();
     }
-    registry.active.insert(execution_id.to_string(), token.clone());
+    registry
+        .active
+        .insert(execution_id.to_string(), token.clone());
     Ok(ExecutionLease {
         execution_id: execution_id.to_string(),
         token,
@@ -120,9 +126,9 @@ fn registry() -> &'static Mutex<ExecutionRegistry> {
 fn validate_execution_id(value: &str) -> Result<(), ToolError> {
     if value.is_empty()
         || value.len() > EXECUTION_ID_MAX
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-        })
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
     {
         return Err(tool_error(
             "CWAPI_AUTOMATION_EXECUTION_ID_INVALID",
