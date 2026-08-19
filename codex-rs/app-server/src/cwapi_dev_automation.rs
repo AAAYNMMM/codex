@@ -3,14 +3,10 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
-use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -26,13 +22,16 @@ use super::validate_existing_directory;
 use super::validate_git_path;
 use super::validate_workspace_member;
 
+#[path = "cwapi_dev_cancel.rs"]
+mod cwapi_dev_cancel;
+use cwapi_dev_cancel::begin_execution;
+use cwapi_dev_cancel::request_cancel;
+
 const AUTOMATION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const AUTOMATION_OUTPUT_LIMIT: usize = 1024 * 1024;
 const AUTOMATION_ARGUMENT_LIMIT: usize = 64;
 const AUTOMATION_ARGUMENT_BYTE_MAX: usize = 4096;
 const AUTOMATION_ENTRYPOINT_MAX: usize = 512;
-const EXECUTION_ID_MAX: usize = 128;
-const PENDING_CANCEL_LIMIT: usize = 256;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -45,40 +44,6 @@ struct WorkspaceAutomationArgs {
     entrypoint: String,
     sha256: String,
     arguments: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct AutomationCancelArgs {
-    execution_id: String,
-    cancel_only: bool,
-}
-
-#[derive(Default)]
-struct ExecutionRegistry {
-    active: HashMap<String, CancellationToken>,
-    pending: VecDeque<String>,
-}
-
-struct ExecutionLease {
-    execution_id: String,
-    token: CancellationToken,
-}
-
-impl ExecutionLease {
-    fn token(&self) -> CancellationToken {
-        self.token.clone()
-    }
-}
-
-impl Drop for ExecutionLease {
-    fn drop(&mut self) {
-        registry()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .active
-            .remove(&self.execution_id);
-    }
 }
 
 pub(super) async fn automation_run(arguments: Option<JsonValue>) -> Result<JsonValue, ToolError> {
@@ -139,7 +104,6 @@ fn decode_args(value: JsonValue) -> Result<WorkspaceAutomationArgs, ToolError> {
         )
     })?;
 
-    validate_execution_id(&value.execution_id)?;
     validate_entrypoint(&value.entrypoint)?;
     validate_sha256(&value.sha256)?;
     if value.arguments.len() > AUTOMATION_ARGUMENT_LIMIT {
@@ -158,91 +122,6 @@ fn decode_args(value: JsonValue) -> Result<WorkspaceAutomationArgs, ToolError> {
     }
     value.sha256.make_ascii_lowercase();
     Ok(value)
-}
-
-fn request_cancel(value: JsonValue) -> Result<JsonValue, ToolError> {
-    let args: AutomationCancelArgs = serde_json::from_value(value).map_err(|_| {
-        tool_error(
-            "CWAPI_AUTOMATION_CANCEL_ARGUMENTS_INVALID",
-            "invalid structured automation cancellation arguments",
-        )
-    })?;
-    if !args.cancel_only {
-        return Err(tool_error(
-            "CWAPI_AUTOMATION_CANCEL_ARGUMENTS_INVALID",
-            "cancelOnly must be true for automation cancellation",
-        ));
-    }
-    validate_execution_id(&args.execution_id)?;
-
-    let active = {
-        let mut registry = registry()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(token) = registry.active.get(&args.execution_id).cloned() {
-            drop(registry);
-            token.cancel();
-            true
-        } else {
-            if !registry.pending.iter().any(|value| value == &args.execution_id) {
-                if registry.pending.len() >= PENDING_CANCEL_LIMIT {
-                    registry.pending.pop_front();
-                }
-                registry.pending.push_back(args.execution_id.clone());
-            }
-            false
-        }
-    };
-
-    Ok(json!({
-        "executionId": args.execution_id,
-        "accepted": true,
-        "active": active,
-    }))
-}
-
-fn begin_execution(execution_id: &str) -> Result<ExecutionLease, ToolError> {
-    validate_execution_id(execution_id)?;
-    let mut registry = registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if registry.active.contains_key(execution_id) {
-        return Err(tool_error(
-            "CWAPI_AUTOMATION_EXECUTION_DUPLICATE",
-            "automation execution id is already active",
-        ));
-    }
-
-    let token = CancellationToken::new();
-    if let Some(index) = registry.pending.iter().position(|value| value == execution_id) {
-        registry.pending.remove(index);
-        token.cancel();
-    }
-    registry.active.insert(execution_id.to_string(), token.clone());
-    Ok(ExecutionLease {
-        execution_id: execution_id.to_string(),
-        token,
-    })
-}
-
-fn registry() -> &'static Mutex<ExecutionRegistry> {
-    static REGISTRY: OnceLock<Mutex<ExecutionRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(ExecutionRegistry::default()))
-}
-
-fn validate_execution_id(value: &str) -> Result<(), ToolError> {
-    if value.is_empty()
-        || value.len() > EXECUTION_ID_MAX
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-        })
-    {
-        return Err(tool_error(
-            "CWAPI_AUTOMATION_EXECUTION_ID_INVALID",
-            "automation execution id is invalid",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_entrypoint(value: &str) -> Result<(), ToolError> {
@@ -515,23 +394,6 @@ mod tests {
             "command": "python evil.py"
         });
         assert!(serde_json::from_value::<WorkspaceAutomationArgs>(value).is_err());
-    }
-
-    #[test]
-    fn cancellation_before_registration_is_observed() {
-        let execution_id = "req-cancel-before-registration";
-        request_cancel(json!({"executionId": execution_id, "cancelOnly": true})).unwrap();
-        let lease = begin_execution(execution_id).unwrap();
-        assert!(lease.token().is_cancelled());
-    }
-
-    #[test]
-    fn active_cancellation_signals_execution_token() {
-        let execution_id = "req-active-cancellation";
-        let lease = begin_execution(execution_id).unwrap();
-        let token = lease.token();
-        request_cancel(json!({"executionId": execution_id, "cancelOnly": true})).unwrap();
-        assert!(token.is_cancelled());
     }
 
     #[test]
