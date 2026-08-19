@@ -1,11 +1,14 @@
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -47,15 +50,17 @@ pub(super) async fn run_bounded(
     let status = match timeout(timeout_limit, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(_)) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = terminate_owned_tree(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             return Err(ExecFailure::Failed);
         }
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            if terminate_owned_tree(&mut child).await.is_err() {
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(ExecFailure::Failed);
+            }
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             return Err(ExecFailure::TimedOut);
@@ -71,6 +76,45 @@ pub(super) async fn run_bounded(
         return Err(ExecFailure::Failed);
     }
     Ok(status)
+}
+
+#[cfg(windows)]
+async fn terminate_owned_tree(child: &mut Child) -> Result<(), ()> {
+    let pid = child.id().ok_or(())?;
+    let taskkill = windows_taskkill_path().ok_or(())?;
+    let status = Command::new(taskkill)
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|_| ())?;
+    if !status.success() {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Ok(());
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(());
+    }
+    child.wait().await.map(|_| ()).map_err(|_| ())
+}
+
+#[cfg(windows)]
+fn windows_taskkill_path() -> Option<PathBuf> {
+    let system_root = std::env::var_os("SystemRoot")?;
+    let path = PathBuf::from(system_root)
+        .join("System32")
+        .join("taskkill.exe");
+    path.is_file().then_some(path)
+}
+
+#[cfg(not(windows))]
+async fn terminate_owned_tree(child: &mut Child) -> Result<(), ()> {
+    child.kill().await.map_err(|_| ())?;
+    child.wait().await.map(|_| ()).map_err(|_| ())
 }
 
 async fn drain_bounded<R>(mut reader: R, limit: usize) -> std::io::Result<bool>
@@ -115,5 +159,13 @@ mod tests {
         let overflow = drain_bounded(reader, 64).await.unwrap();
         write.await.unwrap();
         assert!(overflow);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_tree_termination_uses_system_taskkill() {
+        let path = windows_taskkill_path().expect("SystemRoot taskkill.exe must exist");
+        assert!(path.is_absolute());
+        assert_eq!(path.file_name().and_then(|value| value.to_str()), Some("taskkill.exe"));
     }
 }
