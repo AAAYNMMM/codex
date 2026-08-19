@@ -79,12 +79,14 @@ pub(super) async fn automation_run(arguments: Option<JsonValue>) -> Result<JsonV
 
     let script = validate_execution_entrypoint(&workspace, &args.entrypoint)?;
     verify_worktree_sha256(&script, &args.sha256)?;
-    let output_paths = prepare_output_paths(&args.resource_root, &args.execution_id).map_err(|_| {
-        tool_error(
-            "CWAPI_AUTOMATION_RESOURCE_UNAVAILABLE",
-            "automation output resource directory is unavailable",
-        )
-    })?;
+    let output_paths = prepare_output_paths(&args.resource_root, &args.execution_id).map_err(
+        |_| {
+            tool_error(
+                "CWAPI_AUTOMATION_RESOURCE_UNAVAILABLE",
+                "automation output resource directory is unavailable",
+            )
+        },
+    )?;
     if let Err(failure) = run_entrypoint(
         &script,
         &workspace,
