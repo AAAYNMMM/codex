@@ -71,7 +71,11 @@ pub(super) fn request_cancel(value: JsonValue) -> Result<JsonValue, ToolError> {
             token.cancel();
             true
         } else {
-            if !registry.pending.iter().any(|value| value == &args.execution_id) {
+            if !registry
+                .pending
+                .iter()
+                .any(|value| value == &args.execution_id)
+            {
                 if registry.pending.len() >= PENDING_CANCEL_LIMIT {
                     registry.pending.pop_front();
                 }
