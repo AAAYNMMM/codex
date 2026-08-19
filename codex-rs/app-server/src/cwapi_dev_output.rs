@@ -63,7 +63,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = prepare_output_paths(dir.path(), "REQ:with:colon").unwrap();
         let parent = paths.stdout.parent().unwrap();
-        assert_ne!(parent.file_name().unwrap().to_string_lossy(), "REQ:with:colon");
+        assert_ne!(
+            parent.file_name().unwrap().to_string_lossy(),
+            "REQ:with:colon"
+        );
         assert_eq!(parent.file_name().unwrap().to_string_lossy().len(), 64);
     }
 
@@ -76,6 +79,9 @@ mod tests {
         let resources = output_resources(&paths).unwrap();
         assert_eq!(resources[0].kind, "stdout");
         assert_eq!(resources[0].size_bytes, 5);
-        assert_eq!(resources[0].sha256, format!("{:x}", Sha256::digest(b"hello")));
+        assert_eq!(
+            resources[0].sha256,
+            format!("{:x}", Sha256::digest(b"hello"))
+        );
     }
 }
