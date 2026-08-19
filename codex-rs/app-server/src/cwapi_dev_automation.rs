@@ -13,10 +13,11 @@ use tokio_util::sync::CancellationToken;
 use super::ToolError;
 use super::bounded_stdout;
 use super::cwapi_dev_exec::ExecFailure;
-use super::cwapi_dev_exec::run_bounded_cancellable;
+use super::cwapi_dev_exec::run_bounded_cancellable_to_files;
 use super::exact_workspace_commit;
 use super::run_git;
 use super::tool_error;
+use super::tool_error_with_resources;
 use super::validate_commit;
 use super::validate_existing_directory;
 use super::validate_git_path;
@@ -24,8 +25,13 @@ use super::validate_workspace_member;
 
 #[path = "cwapi_dev_cancel.rs"]
 mod cwapi_dev_cancel;
+#[path = "cwapi_dev_output.rs"]
+mod cwapi_dev_output;
 use cwapi_dev_cancel::begin_execution;
 use cwapi_dev_cancel::request_cancel;
+use cwapi_dev_output::OutputResource;
+use cwapi_dev_output::output_resources;
+use cwapi_dev_output::prepare_output_paths;
 
 const AUTOMATION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const AUTOMATION_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -39,6 +45,7 @@ struct WorkspaceAutomationArgs {
     git_path: PathBuf,
     workspace_root: PathBuf,
     workspace_path: PathBuf,
+    resource_root: PathBuf,
     expected_commit: String,
     execution_id: String,
     entrypoint: String,
@@ -74,14 +81,31 @@ pub(super) async fn automation_run(arguments: Option<JsonValue>) -> Result<JsonV
 
     let script = validate_execution_entrypoint(&workspace, &args.entrypoint)?;
     verify_worktree_sha256(&script, &args.sha256)?;
-    run_entrypoint(
+    let output_paths = prepare_output_paths(&args.resource_root, &args.execution_id).map_err(|_| {
+        tool_error(
+            "CWAPI_AUTOMATION_RESOURCE_UNAVAILABLE",
+            "automation output resource directory is unavailable",
+        )
+    })?;
+    let execution = run_entrypoint(
         &script,
         &workspace,
         &args.entrypoint,
         &args.arguments,
+        &output_paths.stdout,
+        &output_paths.stderr,
         lease.token(),
     )
-    .await?;
+    .await;
+    let resources = output_resources(&output_paths).map_err(|_| {
+        tool_error(
+            "CWAPI_AUTOMATION_RESOURCE_UNAVAILABLE",
+            "automation output resource metadata is unavailable",
+        )
+    })?;
+    if let Err(failure) = execution {
+        return Err(map_exec_failure(failure, resources));
+    }
     verify_worktree_sha256(&script, &args.sha256)?;
 
     let actual_commit =
@@ -93,6 +117,7 @@ pub(super) async fn automation_run(arguments: Option<JsonValue>) -> Result<JsonV
         "entrypoint": args.entrypoint,
         "sha256": args.sha256,
         "exitCode": 0,
+        "resources": resources,
     }))
 }
 
@@ -104,6 +129,12 @@ fn decode_args(value: JsonValue) -> Result<WorkspaceAutomationArgs, ToolError> {
         )
     })?;
 
+    if !value.resource_root.is_absolute() {
+        return Err(tool_error(
+            "CWAPI_AUTOMATION_RESOURCE_ROOT_INVALID",
+            "automation resource root must be absolute",
+        ));
+    }
     validate_entrypoint(&value.entrypoint)?;
     validate_sha256(&value.sha256)?;
     if value.arguments.len() > AUTOMATION_ARGUMENT_LIMIT {
@@ -310,8 +341,10 @@ async fn run_entrypoint(
     workspace: &Path,
     entrypoint: &str,
     arguments: &[String],
+    stdout_path: &Path,
+    stderr_path: &Path,
     cancellation: CancellationToken,
-) -> Result<(), ToolError> {
+) -> Result<(), ExecFailure> {
     let extension = Path::new(entrypoint)
         .extension()
         .and_then(|value| value.to_str())
@@ -334,20 +367,21 @@ async fn run_entrypoint(
     };
     argv.extend(arguments.iter().map(OsString::from));
 
-    run_bounded_cancellable(
+    run_bounded_cancellable_to_files(
         program,
         &argv,
         workspace,
         AUTOMATION_TIMEOUT,
         AUTOMATION_OUTPUT_LIMIT,
         cancellation,
+        stdout_path,
+        stderr_path,
     )
     .await
     .map(|_| ())
-    .map_err(map_exec_failure)
 }
 
-fn map_exec_failure(failure: ExecFailure) -> ToolError {
+fn map_exec_failure(failure: ExecFailure, resources: Vec<OutputResource>) -> ToolError {
     let code = match failure {
         ExecFailure::RuntimeMissing => "CWAPI_AUTOMATION_RUNTIME_MISSING",
         ExecFailure::StartFailed => "CWAPI_AUTOMATION_START_FAILED",
@@ -356,7 +390,11 @@ fn map_exec_failure(failure: ExecFailure) -> ToolError {
         ExecFailure::OutputTooLarge => "CWAPI_AUTOMATION_OUTPUT_TOO_LARGE",
         ExecFailure::Failed => "CWAPI_AUTOMATION_FAILED",
     };
-    tool_error(code, "hash-bound automation execution failed")
+    let resources = resources
+        .into_iter()
+        .filter_map(|resource| serde_json::to_value(resource).ok())
+        .collect();
+    tool_error_with_resources(code, "hash-bound automation execution failed", resources)
 }
 
 #[cfg(test)]
@@ -386,6 +424,7 @@ mod tests {
             "gitPath": "/git",
             "workspaceRoot": "/worktrees",
             "workspacePath": "/worktrees/ws-1",
+            "resourceRoot": "/resources",
             "expectedCommit": "0123456789abcdef0123456789abcdef01234567",
             "executionId": "req-free-command",
             "entrypoint": "automation/check.py",
@@ -408,16 +447,21 @@ mod tests {
 
     #[test]
     fn error_mapping_is_fixed() {
+        let resource = OutputResource {
+            kind: "stdout",
+            sha256: "a".repeat(64),
+            size_bytes: 0,
+        };
         assert_eq!(
-            map_exec_failure(ExecFailure::RuntimeMissing).code,
+            map_exec_failure(ExecFailure::RuntimeMissing, vec![resource.clone()]).code,
             "CWAPI_AUTOMATION_RUNTIME_MISSING"
         );
         assert_eq!(
-            map_exec_failure(ExecFailure::Cancelled).code,
+            map_exec_failure(ExecFailure::Cancelled, vec![resource.clone()]).code,
             "CWAPI_AUTOMATION_CANCELLED"
         );
         assert_eq!(
-            map_exec_failure(ExecFailure::OutputTooLarge).code,
+            map_exec_failure(ExecFailure::OutputTooLarge, vec![resource]).code,
             "CWAPI_AUTOMATION_OUTPUT_TOO_LARGE"
         );
     }
