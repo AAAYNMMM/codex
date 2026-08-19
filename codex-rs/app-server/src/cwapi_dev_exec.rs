@@ -10,15 +10,23 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExecFailure {
     RuntimeMissing,
     StartFailed,
     TimedOut,
+    Cancelled,
     OutputTooLarge,
     Failed,
+}
+
+enum WaitOutcome {
+    Exited(std::io::Result<ExitStatus>),
+    TimedOut,
+    Cancelled,
 }
 
 pub(super) async fn run_bounded(
@@ -27,6 +35,36 @@ pub(super) async fn run_bounded(
     cwd: &Path,
     timeout_limit: Duration,
     output_limit: usize,
+) -> Result<ExitStatus, ExecFailure> {
+    run_bounded_inner(program, argv, cwd, timeout_limit, output_limit, None).await
+}
+
+pub(super) async fn run_bounded_cancellable(
+    program: &str,
+    argv: &[OsString],
+    cwd: &Path,
+    timeout_limit: Duration,
+    output_limit: usize,
+    cancellation: CancellationToken,
+) -> Result<ExitStatus, ExecFailure> {
+    run_bounded_inner(
+        program,
+        argv,
+        cwd,
+        timeout_limit,
+        output_limit,
+        Some(cancellation),
+    )
+    .await
+}
+
+async fn run_bounded_inner(
+    program: &str,
+    argv: &[OsString],
+    cwd: &Path,
+    timeout_limit: Duration,
+    output_limit: usize,
+    cancellation: Option<CancellationToken>,
 ) -> Result<ExitStatus, ExecFailure> {
     let mut command = Command::new(program);
     command
@@ -47,15 +85,15 @@ pub(super) async fn run_bounded(
     let stdout_task = tokio::spawn(drain_bounded(stdout, output_limit));
     let stderr_task = tokio::spawn(drain_bounded(stderr, output_limit));
 
-    let status = match timeout(timeout_limit, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(_)) => {
+    let status = match wait_for_child(&mut child, timeout_limit, cancellation).await {
+        WaitOutcome::Exited(Ok(status)) => status,
+        WaitOutcome::Exited(Err(_)) => {
             let _ = terminate_owned_tree(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             return Err(ExecFailure::Failed);
         }
-        Err(_) => {
+        WaitOutcome::TimedOut => {
             if terminate_owned_tree(&mut child).await.is_err() {
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
@@ -64,6 +102,16 @@ pub(super) async fn run_bounded(
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             return Err(ExecFailure::TimedOut);
+        }
+        WaitOutcome::Cancelled => {
+            if terminate_owned_tree(&mut child).await.is_err() {
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(ExecFailure::Failed);
+            }
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(ExecFailure::Cancelled);
         }
     };
 
@@ -76,6 +124,29 @@ pub(super) async fn run_bounded(
         return Err(ExecFailure::Failed);
     }
     Ok(status)
+}
+
+async fn wait_for_child(
+    child: &mut Child,
+    timeout_limit: Duration,
+    cancellation: Option<CancellationToken>,
+) -> WaitOutcome {
+    let wait = child.wait();
+    tokio::pin!(wait);
+    let timer = sleep(timeout_limit);
+    tokio::pin!(timer);
+    if let Some(token) = cancellation {
+        tokio::select! {
+            result = &mut wait => WaitOutcome::Exited(result),
+            _ = &mut timer => WaitOutcome::TimedOut,
+            _ = token.cancelled() => WaitOutcome::Cancelled,
+        }
+    } else {
+        tokio::select! {
+            result = &mut wait => WaitOutcome::Exited(result),
+            _ = &mut timer => WaitOutcome::TimedOut,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -159,6 +230,11 @@ mod tests {
         let overflow = drain_bounded(reader, 64).await.unwrap();
         write.await.unwrap();
         assert!(overflow);
+    }
+
+    #[test]
+    fn cancelled_is_distinct_from_timeout() {
+        assert_ne!(ExecFailure::Cancelled, ExecFailure::TimedOut);
     }
 
     #[cfg(windows)]
