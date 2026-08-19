@@ -31,9 +31,15 @@ impl fmt::Display for GitExecError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Start(message) => write!(formatter, "failed to start structured Git: {message}"),
-            Self::Wait(message) => write!(formatter, "failed while waiting for structured Git: {message}"),
+            Self::Wait(message) => write!(
+                formatter,
+                "failed while waiting for structured Git: {message}"
+            ),
             Self::TimedOut => formatter.write_str("structured Git operation timed out"),
-            Self::Cleanup(message) => write!(formatter, "structured Git timeout cleanup failed: {message}"),
+            Self::Cleanup(message) => write!(
+                formatter,
+                "structured Git timeout cleanup failed: {message}"
+            ),
             Self::Join(message) => write!(formatter, "structured Git worker failed: {message}"),
         }
     }
@@ -56,7 +62,10 @@ pub(super) async fn run(
     // standard-library process implementation while preserving an async API.
     let mut worker = tokio::task::spawn_blocking(move || {
         let mut command = std::process::Command::new(program);
-        command.args(argv).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .args(argv)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
