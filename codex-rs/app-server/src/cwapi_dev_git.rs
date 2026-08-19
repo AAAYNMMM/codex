@@ -99,8 +99,7 @@ async fn join_worker(
 fn flatten_join(
     joined: Result<Result<Output, GitExecError>, tokio::task::JoinError>,
 ) -> Result<Output, GitExecError> {
-    joined
-        .map_err(|error| GitExecError::Join(error.to_string()))?
+    joined.map_err(|error| GitExecError::Join(error.to_string()))?
 }
 
 async fn stop_timed_out_worker(
@@ -121,13 +120,16 @@ async fn stop_timed_out_worker(
 
 #[cfg(windows)]
 async fn terminate_process_tree(pid: u32) -> Result<(), String> {
-    let system_root = std::env::var_os("SystemRoot")
-        .ok_or_else(|| "SystemRoot is unavailable".to_string())?;
+    let system_root =
+        std::env::var_os("SystemRoot").ok_or_else(|| "SystemRoot is unavailable".to_string())?;
     let taskkill = PathBuf::from(system_root)
         .join("System32")
         .join("taskkill.exe");
     if !taskkill.is_file() {
-        return Err(format!("taskkill.exe is unavailable at {}", taskkill.display()));
+        return Err(format!(
+            "taskkill.exe is unavailable at {}",
+            taskkill.display()
+        ));
     }
     let status = tokio::process::Command::new(taskkill)
         .args(["/PID", &pid.to_string(), "/T", "/F"])
