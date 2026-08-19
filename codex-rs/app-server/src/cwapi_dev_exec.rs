@@ -1,13 +1,14 @@
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::Path;
-#[cfg(windows)]
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::fs::File;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -36,7 +37,7 @@ pub(super) async fn run_bounded(
     timeout_limit: Duration,
     output_limit: usize,
 ) -> Result<ExitStatus, ExecFailure> {
-    run_bounded_inner(program, argv, cwd, timeout_limit, output_limit, None).await
+    run_bounded_inner(program, argv, cwd, timeout_limit, output_limit, None, None).await
 }
 
 pub(super) async fn run_bounded_cancellable(
@@ -54,6 +55,29 @@ pub(super) async fn run_bounded_cancellable(
         timeout_limit,
         output_limit,
         Some(cancellation),
+        None,
+    )
+    .await
+}
+
+pub(super) async fn run_bounded_cancellable_to_files(
+    program: &str,
+    argv: &[OsString],
+    cwd: &Path,
+    timeout_limit: Duration,
+    output_limit: usize,
+    cancellation: CancellationToken,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<ExitStatus, ExecFailure> {
+    run_bounded_inner(
+        program,
+        argv,
+        cwd,
+        timeout_limit,
+        output_limit,
+        Some(cancellation),
+        Some((stdout_path.to_path_buf(), stderr_path.to_path_buf())),
     )
     .await
 }
@@ -65,7 +89,20 @@ async fn run_bounded_inner(
     timeout_limit: Duration,
     output_limit: usize,
     cancellation: Option<CancellationToken>,
+    capture: Option<(PathBuf, PathBuf)>,
 ) -> Result<ExitStatus, ExecFailure> {
+    let capture_files = match capture {
+        Some((stdout_path, stderr_path)) => Some((
+            File::create(stdout_path)
+                .await
+                .map_err(|_| ExecFailure::StartFailed)?,
+            File::create(stderr_path)
+                .await
+                .map_err(|_| ExecFailure::StartFailed)?,
+        )),
+        None => None,
+    };
+
     let mut command = Command::new(program);
     command
         .args(argv)
@@ -82,35 +119,33 @@ async fn run_bounded_inner(
     })?;
     let stdout = child.stdout.take().ok_or(ExecFailure::StartFailed)?;
     let stderr = child.stderr.take().ok_or(ExecFailure::StartFailed)?;
-    let stdout_task = tokio::spawn(drain_bounded(stdout, output_limit));
-    let stderr_task = tokio::spawn(drain_bounded(stderr, output_limit));
+    let (stdout_file, stderr_file) = capture_files
+        .map(|(stdout, stderr)| (Some(stdout), Some(stderr)))
+        .unwrap_or((None, None));
+    let stdout_task = tokio::spawn(drain_bounded_to_file(stdout, output_limit, stdout_file));
+    let stderr_task = tokio::spawn(drain_bounded_to_file(stderr, output_limit, stderr_file));
 
     let status = match wait_for_child(&mut child, timeout_limit, cancellation).await {
         WaitOutcome::Exited(Ok(status)) => status,
         WaitOutcome::Exited(Err(_)) => {
             let _ = terminate_owned_tree(&mut child).await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            ensure_readers(stdout_task, stderr_task).await?;
             return Err(ExecFailure::Failed);
         }
         WaitOutcome::TimedOut => {
             if terminate_owned_tree(&mut child).await.is_err() {
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = ensure_readers(stdout_task, stderr_task).await;
                 return Err(ExecFailure::Failed);
             }
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            ensure_readers(stdout_task, stderr_task).await?;
             return Err(ExecFailure::TimedOut);
         }
         WaitOutcome::Cancelled => {
             if terminate_owned_tree(&mut child).await.is_err() {
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = ensure_readers(stdout_task, stderr_task).await;
                 return Err(ExecFailure::Failed);
             }
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            ensure_readers(stdout_task, stderr_task).await?;
             return Err(ExecFailure::Cancelled);
         }
     };
@@ -188,11 +223,23 @@ async fn terminate_owned_tree(child: &mut Child) -> Result<(), ()> {
     child.wait().await.map(|_| ()).map_err(|_| ())
 }
 
-async fn drain_bounded<R>(mut reader: R, limit: usize) -> std::io::Result<bool>
+async fn drain_bounded<R>(reader: R, limit: usize) -> std::io::Result<bool>
+where
+    R: AsyncRead + Unpin,
+{
+    drain_bounded_to_file(reader, limit, None).await
+}
+
+async fn drain_bounded_to_file<R>(
+    mut reader: R,
+    limit: usize,
+    mut output: Option<File>,
+) -> std::io::Result<bool>
 where
     R: AsyncRead + Unpin,
 {
     let mut total = 0usize;
+    let mut written = 0usize;
     let mut overflow = false;
     let mut buffer = [0u8; 8192];
     loop {
@@ -201,10 +248,27 @@ where
             return Ok(overflow);
         }
         total = total.saturating_add(read);
+        if let Some(file) = output.as_mut() {
+            let remaining = limit.saturating_sub(written);
+            let keep = remaining.min(read);
+            if keep > 0 {
+                file.write_all(&buffer[..keep]).await?;
+                written += keep;
+            }
+        }
         if total > limit {
             overflow = true;
         }
     }
+}
+
+async fn ensure_readers(
+    stdout_task: tokio::task::JoinHandle<std::io::Result<bool>>,
+    stderr_task: tokio::task::JoinHandle<std::io::Result<bool>>,
+) -> Result<(), ExecFailure> {
+    let _ = reader_overflow(stdout_task).await?;
+    let _ = reader_overflow(stderr_task).await?;
+    Ok(())
 }
 
 async fn reader_overflow(
@@ -219,7 +283,6 @@ async fn reader_overflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn bounded_drain_reports_overflow_without_buffering_stream() {
@@ -230,6 +293,21 @@ mod tests {
         let overflow = drain_bounded(reader, 64).await.unwrap();
         write.await.unwrap();
         assert!(overflow);
+    }
+
+    #[tokio::test]
+    async fn capture_keeps_only_bounded_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        let file = File::create(&path).await.unwrap();
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let write = tokio::spawn(async move {
+            writer.write_all(&vec![b'y'; 128]).await.unwrap();
+        });
+        let overflow = drain_bounded_to_file(reader, 64, Some(file)).await.unwrap();
+        write.await.unwrap();
+        assert!(overflow);
+        assert_eq!(std::fs::read(path).unwrap().len(), 64);
     }
 
     #[test]
