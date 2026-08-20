@@ -88,7 +88,6 @@ clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
@@ -132,6 +131,7 @@ rmcp = { workspace = true, default-features = false, features = [
     "transport-streamable-http-server",
 ] }
 serial_test = { workspace = true }
+sha2 = { workspace = true }
 shlex = { workspace = true }
 tar = { workspace = true }
 tokio-tungstenite = { workspace = true }

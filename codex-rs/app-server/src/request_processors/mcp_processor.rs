@@ -1,8 +1,5 @@
 use super::*;
 
-#[path = "../cwapi_dev_mcp.rs"]
-mod cwapi_dev_mcp;
-
 const MCP_TOOL_THREAD_ID_META_KEY: &str = "threadId";
 
 #[derive(Clone)]
@@ -461,20 +458,10 @@ impl McpRequestProcessor {
         params: McpServerToolCallParams,
     ) -> Result<(), JSONRPCErrorError> {
         let outgoing = Arc::clone(&self.outgoing);
-        let request_id = request_id.clone();
-
-        if params.server == cwapi_dev_mcp::SERVER_NAME {
-            tokio::spawn(async move {
-                let response = cwapi_dev_mcp::call(&params.tool, params.arguments).await;
-                let result: Result<McpServerToolCallResponse, JSONRPCErrorError> = Ok(response);
-                outgoing.send_result(request_id, result).await;
-            });
-            return Ok(());
-        }
-
         let thread_id = params.thread_id.clone();
         let (_, thread) = self.load_thread(&thread_id).await?;
         let meta = with_mcp_tool_call_thread_id_meta(params.meta, &thread_id);
+        let request_id = request_id.clone();
 
         tokio::spawn(async move {
             let result = thread
