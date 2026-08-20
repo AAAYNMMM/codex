@@ -66,6 +66,9 @@ pub(super) async fn run(
         let mut command = std::process::Command::new(program);
         command
             .args(argv)
+            // Structured Git never consumes app-server request input. Do not
+            // let Git for Windows inherit the long-lived protocol stdin pipe.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
